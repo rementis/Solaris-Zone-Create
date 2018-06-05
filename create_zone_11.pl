@@ -6,14 +6,28 @@ use Sys::Hostname;
 # Martin Colello
 #
 # Create Solaris zone
+#
+# Heavy mods 08/01/2016, use shared-ip for nics
 
 # Get hostname of global
 my $hostname = hostname();
 chomp($hostname);
 
+my $uname = `uname -a`;
 # Get interfaces for public and storage vlans
-my $show_link_pub = `dladm show-link | egrep 'vlan 120|public0'`;
-my $show_link_sto = `dladm show-link | egrep 'vlan 301|storage0'`;
+my $show_link_pub = `dladm show-link | egrep 'vlan 120|public0|net0'`;
+my $show_link_sto = `dladm show-link | egrep 'vlan 301|storage0|net1'`;
+
+my $ifconfig = `ifconfig -a`;
+my $setpub;
+my $setstor;
+if ($ifconfig =~ /public0/) {
+  $setpub  = 'public0';
+  $setstor = 'storage0';
+} else {
+  $setpub  = 'ipmp0';
+  $setstor = 'ipmp1';
+}
 
 $show_link_pub =~ /(\w+)/;
 my $aggr_pub   = $1;
@@ -149,11 +163,11 @@ if ( $yesorno !~ /y/ ) {
   exit 1;
 }
 
-my $zfscheck = `zfs list`;
-if ( $zfscheck =~ /$zone/ ) {
-  print "ZFS filesystem appears to already exist, exiting.\n";
-  exit 1;
-}
+#my $zfscheck = `zfs list`;
+#if ( $zfscheck =~ /$zone/ ) {
+#  print "ZFS filesystem appears to already exist, exiting.\n";
+#  exit 1;
+#}
 
 
 &log("Creating ZFS filesystem for $zone...");
@@ -169,6 +183,7 @@ foreach(@zfs_list){
     $zoneroot = 'rpool/zones/';
   }
 }
+
 $zoneroot = "$zoneroot"."$zone";
 system("zfs create -o mountpoint=/zones/$zone -o compression=on -o quota=10g $zoneroot");
 system("chmod 700 /zones/$zone");
@@ -178,11 +193,6 @@ system("chmod 700 /zones/$zone");
 my $zone_template = `cat /usr/local/admin/.sol11_zone.xml`;
 
 $zone_template =~ s/ZONENAME/$zone/;
-$zone_template =~ s/PUBLICNIC/$public_ip/;
-#$zone_template =~ s/PUBAGGR/$aggr_pub/;
-$zone_template =~ s/DEFAULTROUTE/$default_router/;
-$zone_template =~ s/STORAGENIC/$storage_ip/;
-#$zone_template =~ s/STORAGGR/$aggr_sto/;
 
 my $zone_template_file = '/tmp/zone_template_file.xml';
 open ZONE, ">$zone_template_file" or die "ABORT! Cannot write file $zone_template_file: $!";
@@ -190,23 +200,21 @@ print ZONE "$zone_template";
 close ZONE;
 
 my $zone_config_file = '/tmp/zone_config_file';
+system("zonecfg -z $zone create");
+system("zonecfg -z $zone remove anet");
+system("zonecfg -z $zone set ip-type=shared");
+
 open ZONE, ">$zone_config_file" or die "ABORT! Cannot write file $zone_config_file: $!";
-print ZONE "create\n";
 print ZONE "set zonepath=/zones/$zone\n";
 print ZONE "set autoboot=false\n";
-print ZONE "set ip-type=exclusive\n";
 print ZONE "set pool=$zone\n";
-print ZONE "add anet\n";
-print ZONE "set linkname=$aggr_pub\n";
-print ZONE "set lower-link=aggr0\n";
-print ZONE "set vlan-id=120\n";
-print ZONE "set mtu=1500\n";
+print ZONE "add net\n";
+print ZONE "set physical=$setpub\n";
+print ZONE "set address=$public_ip".'/24'."\n";
 print ZONE "end\n";
-print ZONE "add anet\n";
-print ZONE "set linkname=$aggr_sto\n";
-print ZONE "set lower-link=aggr0\n";
-print ZONE "set vlan-id=301\n";
-print ZONE "set mtu=9000\n";
+print ZONE "add net\n";
+print ZONE "set physical=$setstor\n";
+print ZONE "set address=$storage_ip".'/24'."\n";
 print ZONE "end\n";
 close ZONE;
 
@@ -218,16 +226,15 @@ system("poolcfg -c 'associate pool $zone \( pset $pset \)' > /dev/null 2>&1");
 system("pooladm -c > /dev/null 2>&1");
 system("pooladm -s > /dev/null 2>&1");
 
-system("zoneadm -z $zone install -c /tmp/zone_template_file.xml 2>&1");
+&log ("Cloning zone");
+system("zoneadm -z $zone clone -c /tmp/zone_template_file.xml tzmcole");
 
-#&log ("Setting up sysidcfg for $zone...");
-#system("/usr/local/admin/scripts/zone.pl $zone > /dev/null 2>&1");
-
+print "\n";
 system("/usr/local/admin/scripts/boot $zone");
 
 &log("\nInitial boot.  Waiting on clean services list.  This can take a few minutes...\n\n");
 
-sleep 20;
+sleep 15;
 
 system("zlogin $zone svcadm disable svc:/network/login:rlogin > /dev/null 2>&1");
 sleep 1;
@@ -289,55 +296,41 @@ while(1) {
   }
 }
 
-&log("Linking perl and adding admin share...");
-system("zlogin $zone \"svcadm disable smtp-notify\"");
-system("zlogin $zone \"svcadm enable -r nfs/client\"");
-system("zlogin $zone mkdir /usr/local");
-system("zlogin $zone mkdir /usr/local/admin");
-system("zlogin $zone mkdir /usr/local/bin");
-system("zlogin $zone ln -s /usr/bin/perl /usr/local/bin/perl");
-my $admin_share = '"echo "infranfs:/unix_share - /usr/local/admin nfs - yes rw,bg,hard,intr,suid,vers=3,proto=tcp,rsize=32768,wsize=32768,retrans=5,timeo=600" >> /etc/vfstab"';
-system("zlogin $zone $admin_share >> /etc/vfstab");
-system("zlogin $zone mountall");
-
-&log("Installing Jass on $zone...");
-system("zlogin $zone /usr/local/admin/install_jass.ksh > /dev/null 2>&1");
-
-&log("Running hob.ksh on $zone...");
-
-system("zlogin $zone /usr/local/admin/hob.ksh");
-
-sleep 3;
-
-system("zlogin $zone \"pkg install top\"");
-
-sleep 3;
-
-&log("Rebooting zone...");
-
-system("zoneadm -z $zone halt");
-sleep 15;
-system("/usr/local/admin/scripts/boot $zone");
-system("rm /tmp/zone_config_file");
-system("/usr/local/admin/scripts/generate_global.pl");
-
-&log("Waiting for all services to be started...");
-sleep 5;
-while(1) {
-  my $CheckServices = `zlogin $zone svcs -xv 2>&1`;
-  if ( $CheckServices eq "" ) {
-    sleep 3;
-    last;
-  }
-  sleep 10;
-}
 
 &log("Setting up etc files in zone $zone...");
-system("zlogin $zone /usr/local/admin/scripts/config_zone.pl");
 
+system("zlogin $zone /usr/local/admin/scripts/config_zone.pl > /dev/null 2>&1");
 
-print "\n\nZone creation script completed.\n\n";
+open HOSTS, ">>/zones/$zone/root/etc/hosts" or die;
+print HOSTS "$public_ip $zone".'.amkor.com'." $zone"."\n";
+close HOSTS;
 
+&log("Setting up solaris publisher in zone $zone...");
+
+my $publisher = 'http://augzd10.amkor.com solaris';
+
+if ( $hostname =~ /p0/ ) { $publisher = 'http://augzp10.amkor.com solaris' }
+
+system("zlogin $zone traceroute 10.96.217.92");
+system("zlogin $zone traceroute 10.96.217.91");
+if ( $uname !~ /i86pc/ ) {
+  system("zlogin $zone pkg set-publisher -G '*' -g $publisher");
+}
+system("zlogin $zone pkg install top pkg://solaris/network/ftp");
+sleep 2;
+system("zlogin $zone mount /usr/local/admin > /dev/null 2>&1");
+sleep 5;
+system("zlogin $zone cp /usr/local/admin/authorized_keys2 /root/.ssh");
+sleep 2;
+system("zlogin $zone cp /usr/local/admin/authorized_keys2 /root/.ssh");
+system("zlogin $zone ln -s /usr/bin/mailx /usr/local/bin/mailx");
+#system("zlogin $zone cp /usr/local/admin/.ssh_config_centrify2016 /etc/centrifydc/ssh_config");
+system("zlogin $zone cp /usr/local/admin/servers/$zone/etc/recent/saptag /");
+system("zlogin $zone cp /usr/local/admin/servers/$zone/etc/recent/systag /");
+system("zlogin $zone cat /usr/local/admin/servers/$zone/etc/recent/crontabs/root");
+system("zlogin $zone /usr/local/admin/hob.ksh");
+
+&log("CHECK /etc/hosts");
 &log("Please \"zlogin $zone\" to set new root password and check etc files.");
 
 exit;

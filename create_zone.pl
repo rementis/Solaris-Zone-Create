@@ -7,6 +7,12 @@ use Sys::Hostname;
 #
 # Create Solaris zone
 
+my $uname = `uname -a`;
+if ( $uname =~ /5\.11/ ) {
+  print "Please use correct script for Solaris 11: create_zone_11.pl\n";
+  exit 3;
+}
+
 # Get hostname of global
 my $hostname = hostname();
 chomp($hostname);
@@ -305,6 +311,7 @@ system("zlogin $zone /usr/local/admin/scripts/config_zone.pl");
 
 print "\n\nZone creation script completed.\n\n";
 
+&log("CHECK /etc/hosts");
 &log("Please \"zlogin $zone\" to set new root password and check etc files.");
 
 exit;
@@ -328,3 +335,4 @@ print LOG "$date - $input\n";
 close LOG;
 
 }# end of log()
+
